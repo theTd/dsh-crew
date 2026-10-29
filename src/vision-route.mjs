@@ -15,14 +15,14 @@
 
 import { writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { describeFileWithProvenance } from './multimodal.mjs';
 import { tr } from './i18n.mjs';
+import { crewConfigDir } from './config-paths.mjs';
 
 const VISION_PROVIDER = 'deepseek-vision';
 const DELEGATE = 'deepseek-official';
-const ATTACH_DIR = join(homedir(), '.config', 'dsh-crew', 'attachments');
+const ATTACH_DIR = join(crewConfigDir(), 'attachments');
 
 const EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' };
 

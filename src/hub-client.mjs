@@ -4,9 +4,17 @@
 
 import { readGlobalConfig } from './install/install.mjs';
 import { pluginEnv } from './plugin-env.mjs';
+import { randomUUID } from 'node:crypto';
 
 const BASE = (pluginEnv('CREW_HUB') ?? readGlobalConfig().hub_url).replace(/\/$/, '');
 const API = `${BASE}/_dsh/dsh-crew`;
+const messagingTokens = new Map();
+
+function messageHeaders(jobId) {
+  const token = messagingTokens.get(jobId);
+  if (!token) throw new Error('this MCP session does not own messaging for that job');
+  return { 'content-type': 'application/json', 'x-dsh-crew-job-token': token };
+}
 
 let lastProbe = { at: 0, ok: false };
 
@@ -39,16 +47,31 @@ async function call(path, init) {
  * Slicing the wait keeps every individual request short enough that no
  * runtime, proxy or load balancer can cut it.
  */
-const MAX_POLL_SLICE_SECONDS = 60;
+const MAX_POLL_SLICE_SECONDS = 30;
 
 export const hub = {
   probe: (binding) => call('/worker-probe', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(binding) }).then(b => b.result),
-  spawn: (spec) => call('/jobs', {
+  spawn: async (spec) => {
+    const token = randomUUID();
+    const { job } = await call('/jobs', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...spec, messaging_token: token }),
+    });
+    messagingTokens.set(job.id, token);
+    return job;
+  },
+  message: (id, message, replyTo) => call(`/jobs/${encodeURIComponent(id)}/messages`, {
+    method: 'POST', headers: messageHeaders(id), body: JSON.stringify({ message, reply_to: replyTo }),
+  }).then(body => body.result),
+  messages: (id, after = 0, wait = 0, signal) => call(`/jobs/${encodeURIComponent(id)}/messages?after=${after}&wait=${wait}`, {
+    headers: messageHeaders(id), signal,
+  }).then(body => body.result),
+  list: () => call('/jobs').then((b) => b.jobs),
+  continueJob: (id, text, timeoutSeconds) => call(`/jobs/${encodeURIComponent(id)}/continue`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(spec),
-  }).then((b) => b.job),
-  list: () => call('/jobs').then((b) => b.jobs),
+    body: JSON.stringify({ text, ...(timeoutSeconds === undefined ? {} : { timeout_seconds: timeoutSeconds }) }),
+  }).then((body) => body.job),
   // The LLM routes the HOST has configured. Only the hub can answer this: the
   // MCP server is a separate process with no ctx.llm. Returns [] rather than
   // throwing when the hub is too old to serve the route, so a stale hub

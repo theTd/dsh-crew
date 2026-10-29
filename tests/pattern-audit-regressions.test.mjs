@@ -7,7 +7,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 // ---------- D1 (P4): agy image-gen must not report success on an unverified file ----------
-test('generate_image(provider=agy) refuses when no nonce-matching image exists (no false success)', async () => {
+// The fixture is a POSIX `#!/bin/sh` shim prepended with `:`; Windows cannot
+// execute it, so the guard cannot run there at all (it failed with ENOENT at
+// b0ddd92 too). Skipped, never weakened: the assertion still runs on POSIX.
+test('generate_image(provider=agy) refuses when no nonce-matching image exists (no false success)',
+  { skip: process.platform === 'win32' ? 'POSIX shell shim cannot run on Windows' : false },
+  async () => {
   const work = mkdtempSync(join(tmpdir(), 'agy-guard-'));
   const home = join(work, 'home');
   const bin = join(work, 'bin');

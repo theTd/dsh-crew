@@ -6,11 +6,13 @@ import { readFileSync, writeFileSync, mkdirSync, copyFileSync, existsSync, readd
 import { dirname, join, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
+import { crewConfigDir } from '../config-paths.mjs';
+import { pluginEnv } from '../plugin-env.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const MARKETPLACE_NAME = 'dsh-crew';
 const PLUGIN_KEY = `dsh-crew@${MARKETPLACE_NAME}`;
-const MCP_TOOLS = ['dsh_run_worker', 'dsh_spawn_worker', 'dsh_worker_status', 'dsh_worker_result', 'dsh_worker_cancel'];
+const MCP_TOOLS = ['dsh_run_worker', 'dsh_spawn_worker', 'dsh_worker_status', 'dsh_worker_result', 'dsh_worker_continue', 'dsh_worker_log', 'dsh_worker_cancel', 'dsh_worker_message', 'dsh_worker_messages', 'dsh_worker_config'];
 
 function backup(file) {
   if (existsSync(file)) {
@@ -61,14 +63,14 @@ export function tomlString(s) {
 try {
   const oldDir = join(homedir(), '.config', 'dsh-workers');
   const newDir = join(homedir(), '.config', 'dsh-crew');
-  if (existsSync(oldDir) && !existsSync(newDir)) {
+  if (pluginEnv('CREW_CONFIG_DIR') === undefined && existsSync(oldDir) && !existsSync(newDir)) {
     const { renameSync } = await import('node:fs');
     renameSync(oldDir, newDir);
   }
 } catch {}
 
 const GLOBAL_CONFIG_FILE = join(CONFIG_DIR_HOME(), 'config.json');
-function CONFIG_DIR_HOME() { return join(homedir(), '.config', 'dsh-crew'); }
+function CONFIG_DIR_HOME() { return crewConfigDir(); }
 
 export const GLOBAL_CONFIG_DEFAULTS = {
   default_tier: 'flash',

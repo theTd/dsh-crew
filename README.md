@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <sub>npm: <code>@zseven-w/dsh-crew</code> &middot; Current plugin release: <code>0.1.0-rc.11</code> &middot; Tested with DSH <code>0.1.1-rc.1</code></sub>
+  <sub>npm: <code>@zseven-w/dsh-crew</code> &middot; Current plugin release: <code>0.1.0-rc.14</code> &middot; Requires DSH <code>0.2.2-alpha.2</code> &middot; hub mode only</sub>
 </p>
 
 <p align="center">
@@ -56,7 +56,7 @@ Workers appear as regular subagents in Claude Code / Codex / Antigravity / Grok 
 
 ### 🏛️ In-Host DSH Sessions
 
-With the bundle installed in a DSH profile, each worker is a first-class DSH session: visible in the Web UI, grouped by working directory, mounted with the Agent preset you choose per tier. Without DSH running, dispatch falls back to a standalone DSH runtime, so CI and headless environments still work.
+With the bundle installed in a DSH profile, each worker is a first-class DSH session: visible in the Web UI, grouped by working directory, mounted with the Agent preset you choose per tier. Workers need a running DSH instance — dispatch without one is refused with a fixed error (ADR 0002), because the SDK runtime this plugin used to launch no longer exists in dsh 0.2.2.
 
 </td>
 <td width="50%">
@@ -109,8 +109,7 @@ Claude Code / Codex / Antigravity / Grok (orchestrator, keeps its own model)
        └─ MCP: dsh_run_worker(tier, effort, cwd, worker=)
             ├─ worker="agy"/"grok" → that external CLI runs the task (explicit opt-in)
             ├─ hub reachable → session inside DSH (visible in the Web UI, grouped by cwd)
-            └─ otherwise     → dsh-jsonrpc-agent runtime (worker.cordis.yml)
-                 └─ DeepSeek V4 Flash / Pro (DSH SDK, event stream → progress and token stats)
+            └─ otherwise     → refused: "standalone dispatch is not supported on dsh 0.2.2" (ADR 0002)
 ```
 
 ## One run, two views
@@ -147,15 +146,9 @@ dsh web
 
 The `link:` protocol symlinks the profile dependency to this repository, so rebuilds are visible immediately.
 
-### Configure DeepSeek credentials (standalone only)
+### Credentials
 
-In hub mode — the installation above — workers run inside the DSH instance and use the DeepSeek credentials it is already configured with. Nothing else to set up.
-
-Only the standalone fallback needs a key of its own: dispatching from a host with no DSH instance running launches a worker runtime as a separate process. Obtain an API key from [platform.deepseek.com](https://platform.deepseek.com) and write it to `~/.config/dsh-crew/.env`:
-
-```
-DEEPSEEK_API_KEY=sk-...
-```
+Workers run inside the DSH instance and use the model credentials that instance is already configured with. Nothing else to set up. The old `~/.config/dsh-crew/.env` key file is no longer read for worker dispatch; it is still read for the native vision key (`DEEPSEEK_API_KEY`) as described below.
 
 ### Verify
 
@@ -163,7 +156,7 @@ DEEPSEEK_API_KEY=sk-...
 node scripts/smoke.mjs
 ```
 
-The smoke test dispatches one cheap job through whichever path is available — the hub when a DSH instance is running, standalone otherwise — and prints which one it used. Within about ten seconds you should see `smoke test passed — configuration OK`. On failure the reason is printed, scoped to the path that was tested.
+The smoke test dispatches one cheap job through the hub and prints the job id and result. Within about ten seconds you should see `smoke test passed — configuration OK`. On failure the reason is printed; with no DSH instance running it says so instead of pretending. `node scripts/smoke-hub.mjs --hub <url>` is the same probe with an explicit hub and `--cancel`.
 
 Then open Settings → DSH Crew and install the host integrations — Claude Code, Codex, Antigravity, Grok — with one click, or drive the same installer from the command line:
 
@@ -213,7 +206,7 @@ These override the global defaults for the current session only, and are enforce
 
 | Command | What it does |
 |---|---|
-| `/dsh-crew:config` | Show or set this session's defaults: `tier=flash\|pro`, `effort=off\|high\|max`, `mode=auto\|hub\|standalone`, `timeout=<seconds>`, `policy=auto\|flash-only\|pro-only`, `escalate=true\|false`, `origin_depth_limit=<1-32>`, `preset_flash/preset_pro=<preset id|default>`, `reset` |
+| `/dsh-crew:config` | Show or set this session's defaults: `tier=flash\|pro`, `effort=off\|high\|max`, `mode=auto\|hub`, `timeout=<seconds>`, `policy=auto\|flash-only\|pro-only`, `escalate=true\|false`, `origin_depth_limit=<1-32>`, `preset_flash/preset_pro=<preset id|default>`, `reset` |
 
 | `/dsh-crew:on` · `/dsh-crew:off` | Turn dispatch for this session on or off (off is a hard switch: the tool refuses) |
 | `/dsh-crew:status` | Live status of worker jobs: tier, progress, tokens, current tool |
@@ -255,7 +248,7 @@ Three prompts are installed for Codex:
 
 | Command | What it does |
 |---|---|
-| `/dsh-config` | Show or set this session's defaults: `tier=flash\|pro`, `effort=off\|high\|max`, `mode=auto\|hub\|standalone`, `timeout=<seconds>`, `policy=auto\|flash-only\|pro-only`, `escalate=true\|false`, `origin_depth_limit=<1-32>`, `preset_flash/preset_pro=<preset id|default>`, `reset` |
+| `/dsh-config` | Show or set this session's defaults: `tier=flash\|pro`, `effort=off\|high\|max`, `mode=auto\|hub`, `timeout=<seconds>`, `policy=auto\|flash-only\|pro-only`, `escalate=true\|false`, `origin_depth_limit=<1-32>`, `preset_flash/preset_pro=<preset id|default>`, `reset` |
 
 | `/dsh-status` | Live status of worker jobs: tier, progress, tokens, current tool |
 | `/dsh-playbook` | Dispatch best practices: choosing flash vs pro, self-contained briefs, parallelism, verifying results, guardrails |
@@ -322,12 +315,21 @@ Uninstall: `node src/install/cli.mjs uninstall-grok`
 
 | Tool | Description |
 |---|---|
-| `dsh_run_worker` | Blocking task dispatch (`tier`: flash/pro, `effort`: off/high/max, `cwd`, `worker`), waits for result |
-| `dsh_spawn_worker` | Async dispatch, returns job id (for parallel fan-out); collect results with `dsh_worker_result` |
-| `dsh_worker_status` | Real-time progress of all jobs (turn/step/current tool/token) + cwd advisory locks |
+| `dsh_run_worker` | Blocking task dispatch (`tier`: flash/pro, `effort`: off/high/max, `cwd`, `worker`, `timeout_seconds`), waits for result |
+| `dsh_spawn_worker` | Async dispatch, returns job id (for parallel fan-out); `timeout_seconds` bounds the job, `lease_seconds` (60–3600) cancels it when the dispatcher stops polling |
+| `dsh_worker_status` | Progress of this session's jobs (turn/step/current tool/token) + cwd locks; `all: true` lists every hub job; response capped near 8 KB |
 | `dsh_worker_result` | Fetch result, can specify `wait_seconds` to wait |
+| `dsh_worker_continue` | Ask a settled worker a follow-up in the same session; the new job's `continued_from` names the old one |
+| `dsh_worker_message` / `dsh_worker_messages` | Steer a running worker; the returned ledger says whether a text is `pending`, `delivered` or `refused` |
+| `dsh_worker_log` | Last events of a job (step / tool_call / tool_result / text / status / message / error) from its per-job log file |
 | `dsh_worker_cancel` | Cancel specified job, terminate its runtime process |
 | `dsh_worker_config` | Read/set session defaults (tier, effort, mode, timeout, policy, escalation) and list `worker_profiles` |
+
+Every job-returning tool ends with two lines a shell can use: a human footer and
+`crew_job: {...}` with status, tokens, message ledger, lease deadline, log path
+and a `wait_command`. Run that command in the background to wait without
+polling: exit `0` done, `1` failed/cancelled/timeout, `2` needs input, `3` still
+running at the deadline, `4` hub unreachable or job unknown, `64` bad arguments.
 
 Progress is simultaneously mirrored to `~/.config/dsh-crew/status.d/` (one shard file per writer, can be read by statusline / external monitoring).
 
@@ -413,9 +415,9 @@ This package is also a valid DSH bundle (`dsh.bundle` + `cordis.patch.yml`). Aft
   - `POST/GET /_dsh/dsh-crew/jobs`: spawn tasks, list, long-poll results, cancel
   - `GET /_dsh/dsh-crew/ping`: health check (MCP shim uses this to detect if hub is running)
   - `POST /_dsh/dsh-crew/install`: one-click install of the host integrations — Claude Code / Codex / Antigravity / Grok (backend of `src/install/`)
-- **Auto-detection**: the hosts' MCP shim auto-detects hub (`DSHPLUGIN_CREW_HUB` env var, default `http://127.0.0.1:3080`)
-  - DSH Web running → jobs enter hub mode (`mode: "hub"`)
-  - Not running → fall back to standalone runtime
+- **Auto-detection**: the hosts' MCP shim finds the hub (`DSHPLUGIN_CREW_HUB` env var, default `http://127.0.0.1:3080`)
+  - Hub reachable → jobs enter hub mode (`mode: "hub"`)
+  - Not reachable → dispatch is refused with `standalone dispatch is not supported on dsh 0.2.2 …` (ADR 0002); start DSH, or use a CLI backend (`worker="agy"` / `"grok"`)
 
 **Windows process inspection:** dispatch-source detection and verified single-process termination use PowerShell/CIM. The ghost-process endpoint refuses process-group termination with `unsupported-platform`; it sends no signal.
 
