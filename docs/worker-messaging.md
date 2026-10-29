@@ -1,6 +1,6 @@
 # Isolated Claude ↔ DSH worker messaging
 
-Status: validated on dsh `0.2.2-alpha.2` for milestones M1–M2. Unit suite: 99 tests, 94 pass, 5 skipped, 0 fail
+Status: validated on dsh `0.2.2-alpha.2` for milestones M1–M2. Unit suite: 117 tests, 112 pass, 5 skipped, 0 fail
 (the TOML installer cases skip because `python3`/`tomllib` is not on this
 machine's `PATH`; the `pattern-audit-regressions` agy case skips on Windows
 because its fixture is a POSIX shell shim — both reasons are in `qa/gaps.md`).
@@ -29,8 +29,9 @@ bound yet — this line is that bound until the reader-facing version matrix lan
   path, and a `wait_command`.
 - **`src/wait-job.mjs`** waits without polling. Exit codes: `0` done, `1`
   failed/cancelled/timeout, `2` needs input, `3` still running at the deadline,
-  `4` hub unreachable or unknown job, `64` bad arguments. Exit `4` reports the
-  last observed status (or `unknown`), never an invented `failed`.
+  `4` hub unreachable or unknown job, `5` a worker message is waiting (relay it,
+  then run the printed wait command again), `64` bad arguments. Exit `4` reports
+  the last observed status (or `unknown`), never an invented `failed`.
 - **`src/job-log.mjs`** writes one JSONL file per job under `<config>/logs/`;
   `dsh_worker_log` reads the last events. The hub and the MCP process share the
   file, so a finished job leaves evidence after its process is gone.
@@ -40,7 +41,8 @@ bound yet — this line is that bound until the reader-facing version matrix lan
   starts, `refused` if the job settles first. A reply to a waiting tool counts as
   delivered immediately. The footer appends `(n undelivered)` when any were lost.
 - **`dsh_worker_continue`** continues a settled job in the same session: a new job,
-  the same session id, `continued_from` pointing back. A live handle is reused;
+  the same session id, `continued_from` pointing back, and — like a spawn — its own
+  mailbox when the dispatcher supplies a messaging token. A live handle is reused;
   after a hub restart the persisted session is resumed.
 - **`status` is session-scoped** by default (`all: true` for the machine view) and
   capped near 8 KB.
@@ -61,8 +63,9 @@ PowerShell argument-passing fix has no automated case.
 
 ## Message flow
 
-1. Claude dispatches with `dsh_spawn_worker`. The MCP process generates a private
-   per-job token and passes it to the hub; tokens are not returned in job views.
+1. Claude dispatches with `dsh_spawn_worker` (or continues one with
+   `dsh_worker_continue`). The MCP process generates a private per-job token and
+   passes it to the hub; tokens are not returned in job views.
 2. The hub mounts `message_parent` in that worker's scoped tool registry. The
    tool can only write to its own mailbox; it accepts no caller-supplied job id.
 3. Claude sends `dsh_worker_message(job_id, message)`; the hub uses the public
@@ -92,21 +95,99 @@ human permission. Existing `ask_user_question` handling is preserved: it stops
 the worker with `needs_input` and returns the question. No automatic approvals
 are added.
 
+## Wake path: a worker message wakes the dispatcher
+
+A worker's `message_parent` call no longer has to wait for an explicit poll. The
+background `wait_command` now treats a worker message as a wake-up event:
+
+1. **Token handoff.** When this MCP session creates a messaging-enabled hub job —
+   spawned or continued — `src/hub-client.mjs` writes the job's private token to
+   `<config>/tokens/<job-id>` (mode 0600, best effort on Windows) through
+   `src/job-token-store.mjs`. The server deletes the file once it observes the
+   job settled and deletes the files it wrote when the MCP process exits
+   normally. Files older than 24 h are pruned at startup, so a crashed session
+   cannot leave a usable token behind forever.
+2. **Mailbox long-poll.** While the token file exists, `src/wait-job.mjs` first
+   long-polls `GET /_dsh/dsh-crew/jobs/<id>/messages?after=<n>&wait=<0..30>`
+   with the `x-dsh-crew-job-token` header, then checks the job status with
+   `wait=0`. The two waits are sequential, so the status/settled/deadline logic
+   and its exit codes are unchanged.
+3. **Exit 5.** If the poll returns at least one event with `kind: "message"` and
+   `sequence > --after`, the command prints one line per message:
+
+   ```text
+   worker_message: {"message_id":"...","text":"...","expects_reply":true,"created_at":"..."}
+   ```
+
+   then the usual footer and `crew_job:` block, whose `wait_command` carries
+   `--after <next_cursor>`, and exits `5`. A `completion` event never exits 5;
+   it falls through to the status check, which reports the settled job with its
+   usual exit code. `--after` defaults to 0 and is non-negative.
+4. **Fallback.** No token file, a denied or malformed mailbox answer, or a hub
+   without the messaging route: the wait behaves exactly as before (status-only
+   waiting, no new exit code). A mailbox *network* error counts like any other
+   unreachable-hub error: retry, then exit 4.
+5. **Dispatcher relay.** `agents/ds-flash.md` and `agents/ds-pro.md` restart the
+   printed wait command first, then end their turn with one line per worker
+   message for the coordinator:
+
+   ```text
+   WORKER MESSAGE job <job_id> message_id=<id> reply_requested=<true|false>: <text verbatim>
+   ```
+
+   The coordinator replies through SendMessage to that agent; the agent forwards
+   it with `dsh_worker_message`, using `reply_to` = the most recent unanswered
+   `expects_reply` message id. A stop/cancel request is not forwarded — the agent
+   cancels the job instead. If the spawn response carries no `wait_command`
+   (an older server), the dispatcher returns the job id and status immediately
+   and the caller fetches it with `dsh_worker_result`.
+
+A job created by `dsh_worker_continue` is messaging-enabled exactly like a
+spawned one: the MCP server mints a token for the new job, the hub creates that
+job's own fresh mailbox, and the continued turn can be steered, read, answered
+with `reply_to`, and ends with a `completion` event and a closed mailbox when it
+settles. The token file follows the new job, so the background waiter wakes on its
+messages too.
+
+The worker's `message_parent` tool resolves its mailbox when it runs, not when it
+was registered. A continuation on the live agent therefore writes into the new
+job's mailbox instead of the previous job's closed one, and the cold resume path
+(after a hub restart) registers the same tool once on the resumed agent. A
+continuation created WITHOUT a token keeps the old behavior — no mailbox, no
+waiter wake — and a `message_parent` call there fails with a clear "no open
+mailbox" error instead of writing into a stale mailbox.
+
+Compatibility runs both ways. A new MCP server against an old hub still continues
+the job (the old hub ignores `messaging_token`); that waiter then gets a refused
+mailbox read and falls back to the status-only wait. An old MCP server against the
+new hub sends no token, so the continued job has no mailbox, exactly as before.
+
+**The hub runs in-process in the DSH web host.** This hub-side continue change
+therefore takes effect only after that host is restarted; until then, a new MCP
+session keeps the ignored-token behavior described above.
+
+The token file is a capability, not a record: it is removed when the job settles
+or the process exits, and never appears in a job view, a log line or a commit.
+
 ## Dispatch behavior and limits
 
-The development `ds-flash` and `ds-pro` roles now return an asynchronous dispatch
-acknowledgement instead of blocking until the worker finishes. A foreground
-blocking dispatch would prevent the main Claude agent from answering the worker.
-The native Haiku wrapper can therefore finish before its DSH worker does; DSH
-job status and the final result determine whether the underlying task completed.
+The development `ds-flash` and `ds-pro` roles are full dispatchers: they spawn
+once, keep a background `wait_command` running, relay worker messages and
+coordinator replies, and report the final result. They never block in a
+foreground wait, because that would hold back messages from the coordinator.
+The native Haiku wrapper can therefore finish a turn before its DSH worker does;
+DSH job status and the final result determine whether the underlying task
+completed.
 
-Messaging currently supports running, hub-owned jobs; CLI/standalone workers cannot
-be messaged. Completing a worker and continuing it in the same session is supported
-(`dsh_worker_continue`, including the cold path after a hub restart); an MCP process
-can only message jobs for which it holds the private token, so a new Claude/MCP
-process cannot adopt an old process's mailbox. The existing general loopback
-job/result endpoints retain their prior behavior; the token scopes message
-delivery, not all access by other processes on the PC.
+Messaging supports running, hub-owned jobs — including a job created by
+`dsh_worker_continue` when its dispatcher supplied a token; CLI/standalone workers
+cannot be messaged. Completing a worker and continuing it in the same session is
+supported (`dsh_worker_continue`, including the cold path after a hub restart),
+and the continued turn is messaged through its own mailbox. An MCP process can
+only message jobs for which it holds the private token (spawn and continue both
+mint one), so a new Claude/MCP process cannot adopt an old process's mailbox. The
+existing general loopback job/result endpoints retain their prior behavior; the
+token scopes message delivery, not all access by other processes on the PC.
 
 The channel relay stops and logs an error if its HTTP read or notification fails;
 the explicit mailbox polling tool remains available. Automatic reconnect/replay
@@ -215,7 +296,7 @@ a model provider, or use credentials:
 
 ```powershell
 $env:DSHPLUGIN_CREW_CONFIG_DIR = Join-Path $PWD '.messaging-dev/test-state'
-node --test tests/worker-mailbox.test.mjs tests/channel-relay.test.mjs tests/worker-messaging-registry.test.mjs tests/messaging-isolation.test.mjs tests/messaging-mcp.test.mjs
+node --test tests/worker-mailbox.test.mjs tests/channel-relay.test.mjs tests/worker-messaging-registry.test.mjs tests/messaging-isolation.test.mjs tests/messaging-mcp.test.mjs tests/hub-continue-messaging.test.mjs tests/continue-old-hub.test.mjs
 Remove-Item Env:DSHPLUGIN_CREW_CONFIG_DIR
 ```
 
@@ -247,13 +328,15 @@ file work inside the scratch workspace. These trials are pending approval.
 | `src/config-paths.mjs` | Shared isolated state-root resolution |
 | `src/worker-mailbox.mjs` | Owner checks, bounded replay, waiting replies, scoped worker tool |
 | `src/channel-relay.mjs` | Hub mailbox to Claude channel adapter |
-| `src/hub/index.mjs` | Hub messaging routes, worker setup, terminal events, isolated endpoint guards |
-| `src/hub-client.mjs` | Per-MCP owner tokens and message HTTP calls |
-| `src/server.mjs` | MCP message tools and optional channel capability |
+| `src/hub/index.mjs` | Hub messaging routes, worker setup, continued-job mailboxes and worker-tool re-targeting, terminal events, isolated endpoint guards |
+| `src/hub-client.mjs` | Per-MCP owner tokens and message HTTP calls; token minting and token-file handoff at spawn and continue |
+| `src/job-token-store.mjs` | Per-job token handoff files: write / read / delete / 24 h prune (0600) |
+| `src/wait-job.mjs` | Wake path: mailbox long-poll, exit 5, `--after` cursor |
+| `src/server.mjs` | MCP message tools, optional channel capability, token cleanup on settle/startup, post-continue wiring |
 | `src/install/install.mjs` | Config override, migration suppression, message tool names |
 | `src/jobs.mjs`, `src/status-shard.mjs` | Redirect runtime sessions and status state |
 | `src/multimodal.mjs`, `src/vision-route.mjs` | Redirect cache and attachment state |
-| `agents/ds-flash.md`, `agents/ds-pro.md` | Asynchronous dispatch and reply guidance |
+| `agents/ds-flash.md`, `agents/ds-pro.md` | Full dispatcher: dispatch, background wait, wake relay, report, continue |
 | `scripts/messaging-dev.ps1` | Isolated preparation/dependency/launch actions; pins the dsh generation and refuses a mismatched CLI |
 | `scripts/smoke-hub.mjs` | Live M1 probe: hub reachability, spawn, result, cancel; exit codes 0/1/2/3 |
 | `src/hub/model-selection.mjs` | dsh 0.2.2 `agent.model.select()` route application |
@@ -261,7 +344,11 @@ file work inside the scratch workspace. These trials are pending approval.
 | `tests/channel-relay.test.mjs` | Channel metadata and disconnect cleanup |
 | `tests/worker-messaging-registry.test.mjs` | Steering, reply routing and cancellation lifecycle |
 | `tests/messaging-isolation.test.mjs` | Configuration/state-root isolation |
-| `tests/messaging-mcp.test.mjs` | Offline MCP/HTTP message round trip, including on-wire token refusal |
+| `tests/messaging-mcp.test.mjs` | Offline MCP/HTTP message round trip, on-wire token refusal, token-file handoff/cleanup, continued-job round trip |
+| `tests/hub-continue-messaging.test.mjs` | Continued-job mailbox, `message_parent` re-targeting (live and resumed), no-token refusal, one tool per agent |
+| `tests/continue-old-hub.test.mjs` | New MCP continue against an old hub: token file written, waiter falls back to status-only |
+| `tests/job-token-store.test.mjs` | Token file round-trip, safe file names, malformed files, 24 h prune |
+| `tests/wait-job.test.mjs` | Exit codes 0/1/2/3/4/5, worker_message lines, `--after`, fallbacks |
 | `tests/hub-model-selection.test.mjs` | Route reaches `model.select()`; no `agent/request` rewrite |
 | `tests/smoke-hub.test.mjs` | Probe arguments and the documented exit codes |
 | `tests/hub-spawn-failure.test.mjs` | A failed spawn leaves no zombie job |

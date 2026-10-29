@@ -329,7 +329,9 @@ Every job-returning tool ends with two lines a shell can use: a human footer and
 `crew_job: {...}` with status, tokens, message ledger, lease deadline, log path
 and a `wait_command`. Run that command in the background to wait without
 polling: exit `0` done, `1` failed/cancelled/timeout, `2` needs input, `3` still
-running at the deadline, `4` hub unreachable or job unknown, `64` bad arguments.
+running at the deadline, `4` hub unreachable or job unknown, `5` a worker message
+is waiting (the wait prints `worker_message:` lines and a `--after` cursor),
+`64` bad arguments.
 
 Progress is simultaneously mirrored to `~/.config/dsh-crew/status.d/` (one shard file per writer, can be read by statusline / external monitoring).
 

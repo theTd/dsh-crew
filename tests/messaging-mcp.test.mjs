@@ -1,13 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { z } from 'zod';
+
+import { tokenFilePathFor } from '../src/job-token-store.mjs';
 
 // Actual hub routes + actual MCP process; only the DSH model/driver is a fixture.
 // No provider key, Claude session or external request is used by this test.
@@ -36,6 +38,7 @@ test('MCP and hub carry a worker question, parent reply and completion over the 
     agents: { async create(options) {
       const tools = new Map(), listeners = new Map(), controller = new AbortController();
       let idle = Promise.resolve();
+      let turn = 0;
       await options.setup({ on(name, fn) { listeners.set(name, fn); },
         tools: { register(tool) {
           // Registration must receive the same object schema a provider sees;
@@ -48,9 +51,12 @@ test('MCP and hub carry a worker question, parent reply and completion over the 
       const agent = {
         session: {}, model: { select() {} }, async whenIdle() { await idle; }, steer() {},
         followup() {
+          turn += 1;
+          const current = turn;
           idle = (async () => {
             const response = await tools.get('message_parent').execute({
-              message: 'Choose a label for this fixture.', wait_for_reply: true,
+              message: current === 1 ? 'Choose a label for this fixture.' : 'And a second label?',
+              wait_for_reply: true,
             }, { signal: controller.signal });
             listeners.get('session/event')({}, { type: 'assistant/message', data: {
               message: { content: [{ type: 'text', text: `Received: ${response.reply}` }] },
@@ -78,9 +84,9 @@ test('MCP and hub carry a worker question, parent reply and completion over the 
     received.push(notification.params);
     for (const wake of waiters) wake();
   });
-  async function incoming(kind) {
+  async function incoming(kind, match = () => true) {
     for (;;) {
-      const item = received.find(message => message.meta?.kind === kind);
+      const item = received.find(message => message.meta?.kind === kind && match(message));
       if (item) return item;
       await new Promise((resolve, reject) => {
         const timer = setTimeout(() => { waiters.delete(wake); reject(new Error('channel delivery timed out')); }, 5000);
@@ -104,16 +110,22 @@ test('MCP and hub carry a worker question, parent reply and completion over the 
   const spawnText = result.content[0].text;
   assert.match(spawnText, /\n\n\[dsh \| job /);
   const job = JSON.parse(spawnText.slice(0, spawnText.indexOf('\n\n[')));
-  const question = await incoming('message');
+  assert.equal(existsSync(tokenFilePathFor(job.id)), true, 'spawn must hand the job token to the background waiter');
+  const question = await incoming('message', message => message.meta?.job_id === job.id);
   assert.equal(question.meta.job_id, job.id);
   assert.equal(question.meta.reply_requested, 'true');
   const reply = await client.callTool({ name: 'dsh_worker_message', arguments: {
     job_id: job.id, message: 'violet', reply_to: question.meta.message_id,
   } });
   assert.equal(JSON.parse(reply.content[0].text).delivery, 'tool_reply');
-  assert.match((await incoming('completion')).content, /Received: violet/);
+  assert.match((await incoming('completion', message => message.meta?.job_id === job.id)).content, /Received: violet/);
   const mailbox = await client.callTool({ name: 'dsh_worker_messages', arguments: { job_id: job.id } });
   assert.equal(JSON.parse(mailbox.content[0].text).messages.length, 2, 'channel delivery must not consume the polling mailbox');
+
+  // The settled job ends its token handoff: the waiter no longer needs it.
+  const settled = await client.callTool({ name: 'dsh_worker_result', arguments: { job_id: job.id } });
+  assert.match(settled.content[0].text, /"status": "done"/);
+  assert.equal(existsSync(tokenFilePathFor(job.id)), false, 'observing a settled job removes its token file');
 
   // Token ownership is enforced on the wire, not only in-process: a missing or
   // foreign token must be refused by the hub route itself.
@@ -122,4 +134,34 @@ test('MCP and hub carry a worker question, parent reply and completion over the 
     const refused = await fetch(route, { headers });
     assert.equal(refused.status, 400, 'a message read without the owning token must be refused');
   }
+
+  // A continued job is messaging-enabled exactly like a spawned one. The
+  // continuation turn's message_parent must land in the NEW job's mailbox —
+  // the spawn-time mailbox is closed — and the token handoff must follow it.
+  const continued = await client.callTool({ name: 'dsh_worker_continue', arguments: {
+    job_id: job.id, text: 'One more question, please.',
+  } });
+  assert.notEqual(continued.isError, true);
+  const continuedText = continued.content[0].text;
+  assert.match(continuedText, /\n\n\[dsh \| job /);
+  const continuedJob = JSON.parse(continuedText.slice(0, continuedText.indexOf('\n\n[')));
+  assert.equal(continuedJob.continued_from, job.id);
+  assert.equal(existsSync(tokenFilePathFor(continuedJob.id)), true, 'continue must hand the new job token to the background waiter');
+
+  const secondQuestion = await incoming('message', message => message.meta?.job_id === continuedJob.id);
+  assert.equal(secondQuestion.meta.reply_requested, 'true');
+  assert.match(secondQuestion.content, /And a second label\?/);
+  const secondReply = await client.callTool({ name: 'dsh_worker_message', arguments: {
+    job_id: continuedJob.id, message: 'indigo', reply_to: secondQuestion.meta.message_id,
+  } });
+  assert.equal(JSON.parse(secondReply.content[0].text).delivery, 'tool_reply');
+  assert.match((await incoming('completion', message => message.meta?.job_id === continuedJob.id)).content, /Received: indigo/);
+
+  const continuedMailbox = await client.callTool({ name: 'dsh_worker_messages', arguments: { job_id: continuedJob.id } });
+  assert.equal(JSON.parse(continuedMailbox.content[0].text).messages.length, 2,
+    'the continued mailbox replays its question and completion');
+  const continuedSettled = await client.callTool({ name: 'dsh_worker_result', arguments: { job_id: continuedJob.id } });
+  assert.match(continuedSettled.content[0].text, /"status": "done"/);
+  assert.equal(existsSync(tokenFilePathFor(continuedJob.id)), false,
+    'observing the settled continued job removes its token file');
 });

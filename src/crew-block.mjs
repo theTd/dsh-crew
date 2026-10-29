@@ -22,9 +22,14 @@ export function elapsedSeconds(job, now = Date.now()) {
   return Number.isFinite(end) ? Math.max(0, Math.round((end - start) / 1000)) : 0;
 }
 
-/** The one command a dispatcher runs to wait for this job, quoted for a shell. */
-export function waitCommand(jobId) {
-  return `node "${WAIT_JOB_PATH}" ${jobId}`;
+/**
+ * The one command a dispatcher runs to wait for this job, quoted for a shell.
+ * A non-zero `after` cursor is the mailbox position the next wait must start
+ * from, so a re-dispatched wait does not replay messages it already relayed.
+ */
+export function waitCommand(jobId, after = 0) {
+  const command = `node "${WAIT_JOB_PATH}" ${jobId}`;
+  return Number.isInteger(after) && after > 0 ? `${command} --after ${after}` : command;
 }
 
 /**
@@ -32,7 +37,7 @@ export function waitCommand(jobId) {
  * reader can rely on the key being present.
  *
  * @param job - a job view (hub or standalone): id, status, model, step, ...
- * @param options - `{ messages, continuedFrom, leaseExpiresAt, logPath }`
+ * @param options - `{ messages, continuedFrom, leaseExpiresAt, logPath, after }`
  */
 export function crewBlock(job, options = {}) {
   // A hub view carries its own ledger; a local view has none and reports zero.
@@ -59,7 +64,7 @@ export function crewBlock(job, options = {}) {
     continued_from: options.continuedFrom ?? job.continued_from ?? null,
     lease_expires_at: options.leaseExpiresAt ?? job.lease_expires_at ?? null,
     log_path: options.logPath ?? null,
-    wait_command: waitCommand(job.id),
+    wait_command: waitCommand(job.id, options.after ?? 0),
   };
 }
 

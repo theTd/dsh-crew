@@ -112,8 +112,29 @@ export class WorkerMailbox {
   }
 }
 
-/** A tool scoped to this worker, never a global tool with caller-supplied job ids. */
-export function parentMessageTool(mailbox) {
+// A continued turn reuses one agent across several job records, each with its
+// own mailbox. A tool captured at spawn time would therefore keep writing to a
+// mailbox that its job closed when it settled. These two failures are stated in
+// the worker's own terms, so a model that hits one puts the message in its final
+// answer instead of retrying against a stale capability.
+const NO_MAILBOX_MESSAGE = 'message_parent is unavailable: the current worker job has no open mailbox '
+  + '(a job only has one when its dispatcher supplied a messaging token, and a settled job has none). '
+  + 'Put the question or update in your final answer instead.';
+const CLOSED_MAILBOX_MESSAGE = 'message_parent is unavailable: the current worker job has already settled, '
+  + 'so its mailbox is closed. Put the question or update in your final answer instead.';
+
+/**
+ * A tool scoped to this worker, never a global tool with caller-supplied job ids.
+ *
+ * `source` is either this worker's mailbox or a resolver `() => mailbox`, called
+ * at execution time. The hub passes a resolver so a turn that continues an
+ * earlier job writes into the job that is running now; a resolver returning
+ * null/undefined means this turn has no usable mailbox, and the tool says so
+ * instead of touching the previous, closed one. A plain mailbox keeps the
+ * original single-job behavior.
+ */
+export function parentMessageTool(source) {
+  const resolve = typeof source === 'function' ? source : () => source;
   return {
     name: 'message_parent',
     description: 'Send a progress update or question to your Claude orchestrator. By default returns acceptance '
@@ -155,6 +176,9 @@ export function parentMessageTool(mailbox) {
         throw new Error('timeout_seconds must be an integer between 1 and 180');
       }
       const { message, wait_for_reply = false, timeout_seconds = 60 } = args;
+      const mailbox = resolve();
+      if (!mailbox) throw new Error(NO_MAILBOX_MESSAGE);
+      if (mailbox.closed) throw new Error(CLOSED_MAILBOX_MESSAGE);
       if (wait_for_reply) return mailbox.request(message, timeout_seconds, exec?.signal);
       const event = mailbox.append('message', message);
       return { accepted: true, message_id: event.message_id };

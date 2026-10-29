@@ -30,6 +30,14 @@ test('the block is complete and stable', () => {
   assert.match(waitCommand('x'), /wait-job\.mjs" x$/);
 });
 
+test('the wait command carries a message cursor only when one is needed', () => {
+  assert.equal(waitCommand('hub-1-abc', 7), `node "${WAIT_JOB_PATH}" hub-1-abc --after 7`);
+  assert.equal(waitCommand('hub-1-abc', 0), `node "${WAIT_JOB_PATH}" hub-1-abc`);
+  assert.equal(waitCommand('hub-1-abc', -1), `node "${WAIT_JOB_PATH}" hub-1-abc`);
+  assert.equal(crewBlock(job, { after: 12 }).wait_command, `node "${WAIT_JOB_PATH}" hub-1-abc --after 12`);
+  assert.equal(crewBlock(job).wait_command, `node "${WAIT_JOB_PATH}" hub-1-abc`);
+});
+
 test('a null session and missing counters do not crash the block', () => {
   const block = crewBlock({ id: 'local-1', status: 'running' });
   assert.equal(block.session_ref, null);

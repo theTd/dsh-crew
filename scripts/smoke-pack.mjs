@@ -40,14 +40,20 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const PKG_NAME = '@zseven-w/dsh-crew';
+// Kept in sync with the registerTool calls in src/server.mjs (same list as
+// scripts/smoke-bundle.mjs; both smoke tests handshake the real MCP server).
 const EXPECTED_TOOLS = [
   'dsh_run_worker',
-  'dsh_worker_config',
   'dsh_worker_probe',
+  'dsh_worker_config',
   'dsh_spawn_worker',
+  'dsh_worker_message',
+  'dsh_worker_messages',
+  'dsh_worker_continue',
   'dsh_worker_status',
   'dsh_worker_result',
   'dsh_worker_cancel',
+  'dsh_worker_log',
 ].sort();
 
 const HOST_RUNTIME_PACKAGES = [

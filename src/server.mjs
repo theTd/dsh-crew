@@ -16,6 +16,11 @@ import { ChannelRelay } from './channel-relay.mjs';
 import { MAX_MESSAGE_LENGTH } from './worker-mailbox.mjs';
 import { withCrewBlock } from './crew-block.mjs';
 import { logPathFor, readJobLog } from './job-log.mjs';
+import { deleteJobToken, pruneJobTokens } from './job-token-store.mjs';
+
+// A crashed MCP session can leave its handoff token files behind; the next
+// session removes anything older than 24 h at startup.
+pruneJobTokens();
 
 const channelEnabled = pluginEnv('CREW_CHANNELS') === '1';
 const server = new McpServer({ name: 'dsh-crew', version: '0.1.0-rc.14' }, {
@@ -86,6 +91,13 @@ function text(obj) {
   return { content: [{ type: 'text', text: typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2) }] };
 }
 
+const TERMINAL_STATUSES = new Set(['done', 'failed', 'cancelled', 'timeout', 'needs_input']);
+
+/** The background waiter no longer needs a token once the job has settled. */
+function releaseSettledToken(view) {
+  if (view && typeof view.id === 'string' && TERMINAL_STATUSES.has(view.status)) deleteJobToken(view.id);
+}
+
 /**
  * A job view plus the footer and the machine-readable `crew_job:` line every
  * job-returning tool ends with. The body stays pretty JSON: one parser reads a
@@ -93,6 +105,7 @@ function text(obj) {
  */
 function jobText(view, extra = {}) {
   if (!view || typeof view !== 'object' || typeof view.id !== 'string') return text(view);
+  releaseSettledToken(view);
   const body = JSON.stringify(view, null, 2);
   return text(withCrewBlock(body, view, { logPath: logPathFor(view.id), ...extra }));
 }
@@ -259,7 +272,10 @@ server.registerTool('dsh_run_worker', {
       // reported as a bare "fetch failed" while the job kept running.
       const got = await hub.get(spawned.id, timeout);
       attachOrigin(got, spawned.id);
-      if (got.status !== 'running') releaseCwdLockByJobId(spawned.id);
+      if (got.status !== 'running') {
+        releaseCwdLockByJobId(spawned.id);
+        releaseSettledToken(got);
+      }
       return { view: got };
     }
     const origin = extendOrigin({ inherited: INHERITED_ORIGIN, backend: 'standalone', cwd: workDir, source: ORCHESTRATOR, depthLimit });
@@ -481,6 +497,13 @@ server.registerTool('dsh_worker_continue', {
     return text({ error: err?.message ?? String(err) });
   }
   try { updateCwdLockHolder({ cwd: before.cwd, jobId: job.id }); } catch { /* advisory only */ }
+  // The same post-spawn wiring a spawned job gets. A continuation is the same
+  // worker, not a new dispatch hop, so it inherits the original origin chain;
+  // the channel relay, the session scope and the returned crew block (with its
+  // wait_command) all start now that the new job id exists. The job token was
+  // already written by hub.continueJob.
+  const inheritedOrigin = hubOrigins.get(job_id);
+  if (inheritedOrigin !== undefined) hubOrigins.set(job.id, inheritedOrigin);
   attachOrigin(job, job.id);
   sessionJobIds.add(job.id);
   watchWorker(job.id);
@@ -518,6 +541,8 @@ server.registerTool('dsh_worker_status', {
   const scoped = all
     ? [...remoteJobs, ...local]
     : [...remoteJobs, ...local].filter((job) => sessionJobIds.has(job.id));
+  // A settled job observed here also ends its token handoff.
+  for (const row of scoped) releaseSettledToken(row);
   return text(capStatusRows([...scoped, ...locks]));
 });
 
@@ -578,6 +603,7 @@ server.registerTool('dsh_worker_log', {
   const body = JSON.stringify({ job_id, ...result }, null, 2);
   const view = await currentJobView(job_id);
   if (view === undefined) return text(body);
+  releaseSettledToken(view);
   return text(withCrewBlock(body, view, { logPath: result.path }));
 });
 

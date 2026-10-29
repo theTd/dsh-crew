@@ -20,14 +20,20 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+// Kept in sync with the registerTool calls in src/server.mjs: this list is the
+// guard that catches a tool silently missing from the published bundle.
 const EXPECTED_TOOLS = [
   'dsh_run_worker',
-  'dsh_worker_config',
   'dsh_worker_probe',
+  'dsh_worker_config',
   'dsh_spawn_worker',
+  'dsh_worker_message',
+  'dsh_worker_messages',
+  'dsh_worker_continue',
   'dsh_worker_status',
   'dsh_worker_result',
   'dsh_worker_cancel',
+  'dsh_worker_log',
 ];
 
 function fail(msg) {

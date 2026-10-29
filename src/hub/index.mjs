@@ -77,12 +77,74 @@ function clipTask(task, cap = 300) {
   return task.length > cap ? task.slice(0, cap) + '…' : task;
 }
 
+/**
+ * A job's own mailbox, built from the optional messaging token its dispatcher
+ * supplied. Spawn and continue share this one rule so a continued job is
+ * messaging-enabled exactly when a spawned one would be: no token means no
+ * mailbox (the pre-messaging behavior), and WorkerMailbox enforces the token's
+ * 32–128 character shape in both paths.
+ */
+function mailboxFromToken(messaging_token) {
+  return messaging_token === undefined ? null : new WorkerMailbox(messaging_token);
+}
+
 export class WorkerRegistry {
   constructor(ctx, shard = createShardWriter('hub')) {
     this.ctx = ctx;
     this.jobs = new Map();
     this.nextId = 1;
     this.shard = shard;
+    // One session can be continued many times: each continuation is a new job
+    // record on the same agent. The pointer says which record is running now,
+    // and the weak map remembers which agents already own the worker tool.
+    this.activeJobBySession = new Map();
+    this.parentToolByAgent = new WeakMap();
+  }
+
+  /** Make `job` the job whose turn currently owns this session's agent. */
+  activateSessionJob(job) {
+    this.activeJobBySession.set(job.sessionId, job.id);
+  }
+
+  /**
+   * The job a session's live agent is reporting for right now. A live agent is
+   * shared by every continuation of its session, so an event listener captured
+   * at spawn time must follow the newest job instead of the one it was born
+   * with; `fallback` keeps the listener useful before any job is active.
+   */
+  activeSessionJob(sessionId, fallback) {
+    const jobId = this.activeJobBySession.get(sessionId);
+    return (jobId === undefined ? undefined : this.jobs.get(jobId)) ?? fallback;
+  }
+
+  /**
+   * The mailbox `message_parent` must write to, resolved when the tool runs.
+   * Returning null for a job that is not running (or was continued without a
+   * token) lets the tool explain itself instead of writing into the previous
+   * job's closed mailbox.
+   */
+  currentMailbox(sessionId) {
+    const jobId = this.activeJobBySession.get(sessionId);
+    const job = jobId === undefined ? undefined : this.jobs.get(jobId);
+    if (job === undefined || job.status !== 'running') return null;
+    return job.mailbox ?? null;
+  }
+
+  /**
+   * Register the worker-facing `message_parent` tool once per agent. The live
+   * continuation path finds the spawn-time registration (its resolver reads the
+   * active job, so the tool follows the new job); the cold resume path has a
+   * fresh agent and registers it here. A second registration would collide with
+   * the first in the agent's tool layer, hence the weak map.
+   */
+  ensureParentMessageTool(agentCtx, sessionId) {
+    if (agentCtx?.tools?.register === undefined) return undefined;
+    const registered = this.parentToolByAgent.get(agentCtx);
+    if (registered !== undefined) return registered;
+    const tool = parentMessageTool(() => this.currentMailbox(sessionId));
+    agentCtx.tools.register(tool);
+    this.parentToolByAgent.set(agentCtx, tool);
+    return tool;
   }
 
   view(job, withResult = false) {
@@ -122,7 +184,7 @@ export class WorkerRegistry {
     }
     // Accept POSIX, Windows drive (D:\x, C:/x) and UNC (\\srv\share) roots.
     if (!isAbsoluteCwd(cwd)) throw new Error('cwd must be an absolute path');
-    const mailbox = messaging_token === undefined ? null : new WorkerMailbox(messaging_token);
+    const mailbox = mailboxFromToken(messaging_token);
     // One canonical form for the job, the advisory lock and the workspace
     // lookup: D:/x and D:\x must map to the same workspace on Windows.
     const cwdPath = canonicalCwd(cwd);
@@ -162,6 +224,7 @@ export class WorkerRegistry {
     job.started = new Promise(resolve => { job.markStarted = resolve; });
     if (lease_seconds !== undefined) job.lease = { seconds: lease_seconds, expiresAt: Date.now() + lease_seconds * 1000 };
     this.jobs.set(id, job);
+    this.activateSessionJob(job);
 
     // A dispatch without an upper bound is a worker nobody can stop by waiting.
     // The timer settles the record itself; dispose() then ends the session and
@@ -185,7 +248,7 @@ export class WorkerRegistry {
     job._timeoutTimer.unref?.();
 
     const onEvent = (session, event) => {
-      const target = job.eventTarget ?? job;
+      const target = this.activeSessionJob(sessionId, job.eventTarget ?? job);
       this.trackEvent(target, target.log, event);
     };
 
@@ -195,14 +258,15 @@ export class WorkerRegistry {
         meta: { cwd: cwdPath, ...(presetId === undefined ? {} : { agentPreset: presetId }) },
         agentOptions: { provider: selection.provider, model: selection.model },
         setup: async (agentCtx) => {
+          job.agentCtx = agentCtx;
           if (presets !== undefined) await presets.mount(agentCtx, presetId);
-          if (mailbox) agentCtx.tools.register(parentMessageTool(mailbox));
+          if (mailbox) this.ensureParentMessageTool(agentCtx, sessionId);
           // Nobody attends a worker session, so a question would wait forever
           // (#13). Claim this agent's requests ahead of the Web answerer.
           installWorkerQuestionHandoff(agentCtx, job, () => this.publish());
           agentCtx.on('session/event', onEvent);
           agentCtx.on('agent/error', (payload) => {
-            const target = job.eventTarget ?? job;
+            const target = this.activeSessionJob(sessionId, job.eventTarget ?? job);
             const err = payload?.error;
             if (target.status !== 'needs_input') target.error = err?.message ?? String(err);
             target.log.record('error', target.error ?? 'agent error');
@@ -407,16 +471,20 @@ export class WorkerRegistry {
    * the persisted session and asks the next question. This is what "the worker
    * still remembers" means; continuing must not need a fresh, amnesiac worker.
    */
-  async continueJob(id, text, { timeout_seconds } = {}) {
+  async continueJob(id, text, { timeout_seconds, messaging_token } = {}) {
     const previous = this.jobs.get(id);
     if (previous === undefined) throw new Error(`no such job: ${id}`);
     if (previous.status === 'running') throw new Error('worker is running: use dsh_worker_message to steer it');
     if (previous.continueOpen === true) throw new Error('worker is already being continued');
     messageText(text);
+    // Same rule (and the same 32–128 character validation) as spawn. Built
+    // before the claim is taken: a bad token must fail without leaving the old
+    // job marked as being continued.
+    const mailbox = mailboxFromToken(messaging_token);
     previous.continueOpen = true;
 
     try {
-      return this.startContinuation(previous, text, timeout_seconds);
+      return this.startContinuation(previous, text, timeout_seconds, mailbox);
     } catch (err) {
       previous.continueOpen = false;
       throw err;
@@ -424,7 +492,7 @@ export class WorkerRegistry {
   }
 
   /** The body of continueJob; the claim is already taken by the caller. */
-  startContinuation(previous, text, timeout_seconds) {
+  startContinuation(previous, text, timeout_seconds, mailbox = null) {
     const id = previous.id;
     const cfg = this.getConfig?.() ?? {};
     const presets = this.ctx.get('agentPresets');
@@ -443,11 +511,14 @@ export class WorkerRegistry {
       tokens: { input: 0, output: 0, reasoning: 0 },
       startedAt: new Date().toISOString(), endedAt: null,
       result: null, error: null, stopReason: null, handle: null, waiters: [],
-      texts: [], mailbox: null, log, messages: { delivered: 0, pending: 0, refused: 0 }, _pendingMessages: 0,
+      texts: [], mailbox: mailbox ?? null, log, messages: { delivered: 0, pending: 0, refused: 0 }, _pendingMessages: 0,
       presetId: previous.presetId, continued_from: id, _continues: id,
     };
     job.started = new Promise(resolve => { job.markStarted = resolve; });
     this.jobs.set(newId, job);
+    // From this moment the worker tool resolves to THIS job's mailbox, even
+    // while the live agent is the one spawned for the previous job.
+    this.activateSessionJob(job);
 
     job._timeoutTimer = setTimeout(() => {
       if (job.status !== 'running') return;
@@ -471,6 +542,22 @@ export class WorkerRegistry {
         previous.eventTarget = job;
         const live = previous.handle;
         job.handle = live;
+        // The continuation lives on the previous job's agent, so it owns that
+        // agent's tool registry too; a chained continuation must find it here.
+        // `handle.agent.ctx` is the scoped context the host passes to setup, so
+        // a job created before this bookkeeping existed still has a way back.
+        job.agentCtx = previous.agentCtx ?? live.agent.ctx;
+        // The spawn-time tool (if the old job had a mailbox) already resolves
+        // its mailbox per call, so reusing the agent must NOT register a second
+        // one. An agent spawned without a token has no tool yet; if this
+        // continuation supplied one, add it once before the turn starts.
+        if (job.mailbox !== null) {
+          try {
+            this.ensureParentMessageTool(job.agentCtx, previous.sessionId);
+          } catch (err) {
+            log.record('error', `message_parent unavailable: ${err?.message ?? err}`);
+          }
+        }
         await live.agent.whenIdle();
         if (job.status !== 'running') return;
         live.agent.followup(userMessage(text));
@@ -490,13 +577,25 @@ export class WorkerRegistry {
         resumeSessionId: previous.sessionId,
         agentOptions: { provider: selection.provider, model: selection.model },
         setup: async (agentCtx) => {
+          job.agentCtx = agentCtx;
           if (presets !== undefined) await presets.mount(agentCtx, previous.presetId);
+          // A fresh agent has no spawn-time registration to reuse; register the
+          // tool once when this continuation has a mailbox to write to. Without
+          // a token the resumed turn keeps the old no-tool behavior.
+          if (job.mailbox !== null) this.ensureParentMessageTool(agentCtx, previous.sessionId);
           installWorkerQuestionHandoff(agentCtx, job, () => this.publish());
-          agentCtx.on('session/event', (session, event) => this.trackEvent(job, log, event));
+          // This resumed handle can itself be continued later; its listeners
+          // must follow the newest job on the session, exactly like the ones a
+          // live agent inherited from spawn.
+          agentCtx.on('session/event', (session, event) => {
+            const target = this.activeSessionJob(previous.sessionId, job);
+            this.trackEvent(target, target.log, event);
+          });
           agentCtx.on('agent/error', (payload) => {
+            const target = this.activeSessionJob(previous.sessionId, job);
             const err = payload?.error;
-            if (job.status !== 'needs_input') job.error = err?.message ?? String(err);
-            log.record('error', job.error ?? 'agent error');
+            if (target.status !== 'needs_input') target.error = err?.message ?? String(err);
+            target.log.record('error', target.error ?? 'agent error');
           });
         },
       });
@@ -790,7 +889,10 @@ export async function apply(ctx) {
           }
           if (req.method === 'POST' && parts.length === 2 && parts[1] === 'continue') {
             const body = await readBody(req);
-            const job = await hub.continueJob(parts[0], body.text, { timeout_seconds: body.timeout_seconds });
+            const job = await hub.continueJob(parts[0], body.text, {
+              timeout_seconds: body.timeout_seconds,
+              messaging_token: body.messaging_token,
+            });
             return sendJson(res, 200, { ok: true, job: hub.view(job) });
           }
           return sendJson(res, 404, { ok: false, error: 'unknown jobs endpoint' });
