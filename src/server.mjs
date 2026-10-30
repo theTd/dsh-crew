@@ -92,6 +92,8 @@ function text(obj) {
 }
 
 const TERMINAL_STATUSES = new Set(['done', 'failed', 'cancelled', 'timeout', 'needs_input']);
+// Longest hard bound a caller may set for one worker job (6 h).
+const MAX_JOB_TIMEOUT_SECONDS = 21_600;
 
 /** The background waiter no longer needs a token once the job has settled. */
 function releaseSettledToken(view) {
@@ -215,7 +217,7 @@ server.registerTool('dsh_run_worker', {
     effort: effortSchema,
     worker: workerSchema,
     cwd: z.string().optional().describe('Workspace directory for the worker. Relative paths resolve against the caller\'s current workspace; "." or "current" mean the current workspace. Omit for the current workspace.'),
-    timeout_seconds: z.number().int().positive().max(7200).optional(),
+    timeout_seconds: z.number().int().positive().max(MAX_JOB_TIMEOUT_SECONDS).optional(),
     allow_concurrent_cwd: allowConcurrentCwdSchema,
   },
 }, async ({ task, tier, effort, worker, cwd, timeout_seconds, allow_concurrent_cwd }) => {
@@ -330,7 +332,7 @@ server.registerTool('dsh_worker_config', {
     default_tier: z.enum(['flash', 'pro']).optional(),
     default_effort: z.enum(['off', 'high', 'max']).optional(),
     mode: z.enum(['auto', 'hub', 'standalone']).optional(),
-    default_timeout_seconds: z.number().int().positive().max(7200).optional(),
+    default_timeout_seconds: z.number().int().positive().max(MAX_JOB_TIMEOUT_SECONDS).optional(),
     tier_policy: z.enum(['auto', 'flash-only', 'pro-only']).optional().describe('flash-only / pro-only clamp every dispatch to one tier'),
     escalate_on_failure: z.boolean().optional().describe('retry a failed blocking flash run once on pro'),
     preset_flash: z.string().optional().describe('hub-mode agent preset for flash workers (preset id, or "default")'),
@@ -387,7 +389,7 @@ server.registerTool('dsh_spawn_worker', {
     worker: workerSchema,
     cwd: z.string().optional().describe('Workspace directory for the worker. Relative paths resolve against the caller\'s current workspace; "." or "current" mean the current workspace. Omit for the current workspace.'),
     allow_concurrent_cwd: allowConcurrentCwdSchema,
-    timeout_seconds: z.number().int().min(1).max(7200).optional().describe('Hard upper bound for the whole job, in seconds. At the bound the job is disposed and its status becomes "timeout" with a fixed error. Omit for the hub/config default.'),
+    timeout_seconds: z.number().int().min(1).max(MAX_JOB_TIMEOUT_SECONDS).optional().describe('Hard upper bound for the whole job, in seconds. At the bound the job is disposed and its status becomes "timeout" with a fixed error. Omit for the hub/config default.'),
     lease_seconds: z.number().int().min(60).max(3600).optional().describe('Opt-in lease: while you keep polling (dsh_worker_result / status / wait-job), the job keeps running; after this many seconds without a poll it is cancelled with "cancelled: dispatcher stopped polling (lease expired)". Omit for no lease.'),
   },
 }, async ({ task, tier, effort, worker, cwd, allow_concurrent_cwd, timeout_seconds, lease_seconds }) => {
@@ -473,7 +475,7 @@ server.registerTool('dsh_worker_continue', {
   inputSchema: {
     job_id: z.string().describe('the settled job to continue'),
     text: z.string().trim().min(1).max(MAX_MESSAGE_LENGTH).describe('the follow-up prompt; the worker still has its session context'),
-    timeout_seconds: z.number().int().min(1).max(7200).optional().describe('hard bound for the new job; omit for the hub/config default'),
+    timeout_seconds: z.number().int().min(1).max(MAX_JOB_TIMEOUT_SECONDS).optional().describe('hard bound for the new job; omit for the hub/config default'),
   },
 }, async ({ job_id, text, timeout_seconds }) => {
   // Continue runs text inside an existing session, which is stronger than
