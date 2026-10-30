@@ -77,6 +77,8 @@ export const GLOBAL_CONFIG_DEFAULTS = {
   default_effort: 'max',
   mode: 'auto',
   default_timeout_seconds: 1800,
+  // A hub job with no session event for this long is settled as stalled; 0 disables.
+  stall_timeout_seconds: 1800,
   hub_url: 'http://127.0.0.1:3080',
   // auto = orchestrator picks the tier; flash-only / pro-only clamp every
   // dispatch to one tier at the tool layer regardless of what was requested.

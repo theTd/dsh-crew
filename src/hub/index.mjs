@@ -88,6 +88,24 @@ function mailboxFromToken(messaging_token) {
   return messaging_token === undefined ? null : new WorkerMailbox(messaging_token);
 }
 
+// setTimeout fires at once for delays above 2^31-1 ms (~24.8 days), so every
+// bound, explicit or from config, is clamped to one day.
+const MAX_BOUND_SECONDS = 86_400;
+
+/** Hard bound for a job: the explicit value, else the config default, else 30 min. */
+function hardBoundSeconds(explicit, cfg) {
+  const raw = Number.isFinite(explicit) && explicit > 0 ? explicit
+    : (Number.isFinite(cfg.default_timeout_seconds) && cfg.default_timeout_seconds > 0 ? cfg.default_timeout_seconds : 1800);
+  return Math.min(MAX_BOUND_SECONDS, Math.max(1, Math.floor(raw)));
+}
+
+/** Stall bound: no session event for this long settles the job. 0 disables it. */
+function stallBoundSeconds(cfg) {
+  const raw = cfg.stall_timeout_seconds;
+  if (raw === 0) return 0;
+  return Number.isFinite(raw) && raw > 0 ? Math.min(MAX_BOUND_SECONDS, Math.floor(raw)) : 1800;
+}
+
 export class WorkerRegistry {
   constructor(ctx, shard = createShardWriter('hub')) {
     this.ctx = ctx;
@@ -227,25 +245,7 @@ export class WorkerRegistry {
     this.activateSessionJob(job);
 
     // A dispatch without an upper bound is a worker nobody can stop by waiting.
-    // The timer settles the record itself; dispose() then ends the session and
-    // the existing finally keeps the final status ('timeout') intact.
-    const timeoutSeconds = Number.isFinite(timeout_seconds) && timeout_seconds > 0
-      ? Math.min(86_400, Math.max(1, Math.floor(timeout_seconds)))
-      : (Number.isFinite(cfg.default_timeout_seconds) && cfg.default_timeout_seconds > 0 ? cfg.default_timeout_seconds : 1800);
-    job._timeoutTimer = setTimeout(() => {
-      if (job.status !== 'running') return;
-      job.status = 'timeout';
-      job.error = `timed out after ${timeoutSeconds}s`;
-      job.log.record('status', job.error, { status: 'timeout' });
-      this.publish();
-      const handle = job.handle;
-      job.handle = undefined;
-      handle?.dispose?.().catch(() => {});
-      // A hung agent may never unblock whenIdle; settle the record here so the
-      // job does not stay half-finished (no endedAt, pending counts, waiters).
-      this.finish(job, job.log);
-    }, timeoutSeconds * 1000);
-    job._timeoutTimer.unref?.();
+    this.armBounds(job, hardBoundSeconds(timeout_seconds, cfg), stallBoundSeconds(cfg));
 
     const onEvent = (session, event) => {
       const target = this.activeSessionJob(sessionId, job.eventTarget ?? job);
@@ -323,6 +323,46 @@ export class WorkerRegistry {
     if (job?.lease !== undefined) job.lease.expiresAt = Date.now() + job.lease.seconds * 1000;
   }
 
+  /**
+   * Arm a job's two bounds: a hard wall-clock timer, and a stall bound that the
+   * watchdog checks against the last session event (sweepStalls).
+   */
+  armBounds(job, hardSeconds, stallSeconds) {
+    job.lastProgressAt = Date.now();
+    job.stallSeconds = stallSeconds;
+    job._timeoutTimer = setTimeout(() => this.expire(job, `timed out after ${hardSeconds}s`), hardSeconds * 1000);
+    job._timeoutTimer.unref?.();
+  }
+
+  /**
+   * Settle a running job as 'timeout'. The record is settled here, not after
+   * dispose(): a hung agent may never unblock whenIdle, and the job must not
+   * stay half-finished (no endedAt, pending counts, waiters). The last text
+   * the worker wrote is kept as the result so the orchestrator can resume.
+   */
+  expire(job, error) {
+    if (job.status !== 'running') return;
+    job.status = 'timeout';
+    job.error = error;
+    if (!job.result && job.texts.length > 0) job.result = job.texts.at(-1);
+    job.log.record('status', job.error, { status: 'timeout' });
+    this.publish();
+    const handle = job.handle;
+    job.handle = undefined;
+    try { handle?.dispose?.().catch(() => {}); } catch {}
+    this.finish(job, job.log);
+  }
+
+  /** Settle running jobs with no session event within their stall bound. Called by the watchdog. */
+  sweepStalls(now = Date.now()) {
+    for (const job of this.jobs.values()) {
+      if (job.status !== 'running' || !(job.stallSeconds > 0)) continue;
+      const idleMs = now - job.lastProgressAt;
+      if (idleMs < job.stallSeconds * 1000) continue;
+      this.expire(job, `stalled: no progress for ${Math.floor(idleMs / 1000)}s (stall bound ${job.stallSeconds}s)`);
+    }
+  }
+
   /** Cancel running jobs whose dispatcher stopped polling. Called by the watchdog. */
   sweepLeases(now = Date.now()) {
     for (const job of this.jobs.values()) {
@@ -352,6 +392,7 @@ export class WorkerRegistry {
 
   /** Fold one session event into a job's counters and its per-job log. */
   trackEvent(job, log, event) {
+    job.lastProgressAt = Date.now();
     switch (event.type) {
       case 'step/start':
         job.turn = event.data?.turn ?? job.turn;
@@ -501,10 +542,6 @@ export class WorkerRegistry {
     const cfg = this.getConfig?.() ?? {};
     const presets = this.ctx.get('agentPresets');
     const selection = { provider: previous.provider, model: previous.model, reasoningEffort: previous.effort };
-    const timeoutSeconds = Number.isFinite(timeout_seconds) && timeout_seconds > 0
-      ? Math.min(86_400, Math.max(1, Math.floor(timeout_seconds)))
-      : (Number.isFinite(cfg.default_timeout_seconds) && cfg.default_timeout_seconds > 0 ? cfg.default_timeout_seconds : 1800);
-
     const newId = `hub-${this.nextId++}-${Date.now().toString(36)}`;
     const log = new JobLog(newId);
     log.record('status', `continued from ${id}`, { continued_from: id });
@@ -524,18 +561,7 @@ export class WorkerRegistry {
     // while the live agent is the one spawned for the previous job.
     this.activateSessionJob(job);
 
-    job._timeoutTimer = setTimeout(() => {
-      if (job.status !== 'running') return;
-      job.status = 'timeout';
-      job.error = `timed out after ${timeoutSeconds}s`;
-      job.log.record('status', job.error, { status: 'timeout' });
-      this.publish();
-      const handle = job.handle;
-      job.handle = undefined;
-      handle?.dispose?.().catch(() => {});
-      this.finish(job, job.log);
-    }, timeoutSeconds * 1000);
-    job._timeoutTimer.unref?.();
+    this.armBounds(job, hardBoundSeconds(timeout_seconds, cfg), stallBoundSeconds(cfg));
 
     const run = async () => {
       // Preferred: the old agent is still live, so reusing its handle continues
@@ -734,7 +760,8 @@ export async function apply(ctx) {
   // Lease watchdog: a dispatcher that stops polling (closed window, crashed
   // session) must not leave a worker burning quota forever. Only opt-in leases
   // are swept; a job without lease_seconds is never auto-cancelled.
-  const leaseTimer = setInterval(() => hub.sweepLeases(), 15_000);
+  // The same tick settles stalled jobs (no session event within the stall bound).
+  const leaseTimer = setInterval(() => { hub.sweepLeases(); hub.sweepStalls(); }, 15_000);
   leaseTimer.unref?.();
   disposers.push(() => clearInterval(leaseTimer));
 
