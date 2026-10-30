@@ -48,9 +48,10 @@ export class WorkerMailbox {
     for (const pending of this.replies.values()) pending.reject(new Error('worker mailbox is closed'));
   }
 
-  request(text, seconds = 60, signal) {
-    if (!Number.isInteger(seconds) || seconds < 1 || seconds > 180) {
-      throw new Error('reply timeout must be between 1 and 180 seconds');
+  // `maxSeconds` lets the hub wait longer than a worker's own message_parent call.
+  request(text, seconds = 60, signal, maxSeconds = 180) {
+    if (!Number.isInteger(seconds) || seconds < 1 || seconds > maxSeconds) {
+      throw new Error(`reply timeout must be between 1 and ${maxSeconds} seconds`);
     }
     if (signal?.aborted) throw signal.reason ?? new Error('reply wait aborted');
     const event = this.append('message', text, { expects_reply: true });

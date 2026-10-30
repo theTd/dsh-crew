@@ -262,8 +262,12 @@ export class WorkerRegistry {
           if (presets !== undefined) await presets.mount(agentCtx, presetId);
           if (mailbox) this.ensureParentMessageTool(agentCtx, sessionId);
           // Nobody attends a worker session, so a question would wait forever
-          // (#13). Claim this agent's requests ahead of the Web answerer.
-          installWorkerQuestionHandoff(agentCtx, job, () => this.publish());
+          // (#13). Claim this agent's requests ahead of the Web answerer and
+          // put them to the orchestrator through the running job's mailbox.
+          installWorkerQuestionHandoff(agentCtx, job, () => this.publish(), {
+            currentJob: () => this.activeSessionJob(sessionId, job.eventTarget ?? job),
+            currentMailbox: () => this.currentMailbox(sessionId),
+          });
           agentCtx.on('session/event', onEvent);
           agentCtx.on('agent/error', (payload) => {
             const target = this.activeSessionJob(sessionId, job.eventTarget ?? job);
@@ -583,7 +587,10 @@ export class WorkerRegistry {
           // tool once when this continuation has a mailbox to write to. Without
           // a token the resumed turn keeps the old no-tool behavior.
           if (job.mailbox !== null) this.ensureParentMessageTool(agentCtx, previous.sessionId);
-          installWorkerQuestionHandoff(agentCtx, job, () => this.publish());
+          installWorkerQuestionHandoff(agentCtx, job, () => this.publish(), {
+            currentJob: () => this.activeSessionJob(previous.sessionId, job),
+            currentMailbox: () => this.currentMailbox(previous.sessionId),
+          });
           // This resumed handle can itself be continued later; its listeners
           // must follow the newest job on the session, exactly like the ones a
           // live agent inherited from spawn.
