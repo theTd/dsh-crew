@@ -9,6 +9,7 @@ import { isAbsoluteCwd, canonicalCwd } from '../paths.mjs';
 import { createShardWriter, readMergedStatus } from '../status-shard.mjs';
 import { procAlive, killWorkerProcess, parsePid, ProcKillRefused } from '../proc-kill.mjs';
 import { installWorkerQuestionHandoff } from '../worker-question.mjs';
+import { installWorkerApprovalHandoff, approvalWaitSeconds, rememberToolCall } from './worker-approval.mjs';
 import { probeProvider } from '../provider-probe.mjs';
 import { crewConfigDir } from '../config-paths.mjs';
 import { WorkerMailbox, parentMessageTool, messageText, MAX_MESSAGE_LENGTH } from '../worker-mailbox.mjs';
@@ -130,6 +131,33 @@ export class WorkerRegistry {
     // and the weak map remembers which agents already own the worker tool.
     this.activeJobBySession = new Map();
     this.parentToolByAgent = new WeakMap();
+    // "Allow for this session" answers, per worker session: they outlive one
+    // job (a continuation is the same session) but not this hub process.
+    this.approvalGrants = new Map();
+  }
+
+  /** The approval keys a worker session's dispatcher allowed for the rest of the session. */
+  sessionApprovalGrants(sessionId) {
+    let grants = this.approvalGrants.get(sessionId);
+    if (grants === undefined) this.approvalGrants.set(sessionId, grants = new Set());
+    return grants;
+  }
+
+  /**
+   * Put a worker agent's native approval requests to its dispatcher (see
+   * worker-approval.mjs). Installed next to the question handoff on every
+   * agent the hub creates or resumes; like it, it follows the session's
+   * active job.
+   */
+  installApprovalHandoff(agentCtx, job, sessionId) {
+    installWorkerApprovalHandoff(agentCtx, job, () => this.publish(), {
+      sessionId,
+      currentJob: () => this.activeSessionJob(sessionId, job.eventTarget ?? job),
+      currentMailbox: () => this.currentMailbox(sessionId),
+      grants: () => this.sessionApprovalGrants(sessionId),
+      waitSeconds: () => approvalWaitSeconds(this.getConfig?.() ?? {}),
+      ptcRuntime: () => agentCtx.get?.('ptcRuntime') ?? this.ctx.get?.('ptcRuntime'),
+    });
   }
 
   /** Make `job` the job whose turn currently owns this session's agent. */
@@ -281,6 +309,7 @@ export class WorkerRegistry {
             currentJob: () => this.activeSessionJob(sessionId, job.eventTarget ?? job),
             currentMailbox: () => this.currentMailbox(sessionId),
           });
+          this.installApprovalHandoff(agentCtx, job, sessionId);
           agentCtx.on('session/event', onEvent);
           agentCtx.on('agent/error', (payload) => {
             const target = this.activeSessionJob(sessionId, job.eventTarget ?? job);
@@ -370,6 +399,9 @@ export class WorkerRegistry {
   sweepStalls(now = Date.now()) {
     for (const job of this.jobs.values()) {
       if (job.status !== 'running' || !(job.stallSeconds > 0)) continue;
+      // Waiting on its dispatcher for an approval is not a stall; that wait
+      // has its own bound (approval_wait_seconds).
+      if (job.awaitingParent > 0) continue;
       const idleMs = now - job.lastProgressAt;
       if (idleMs < job.stallSeconds * 1000) continue;
       this.expire(job, `stalled: no progress for ${Math.floor(idleMs / 1000)}s (stall bound ${job.stallSeconds}s)`);
@@ -406,6 +438,7 @@ export class WorkerRegistry {
   /** Fold one session event into a job's counters and its per-job log. */
   trackEvent(job, log, event) {
     job.lastProgressAt = Date.now();
+    rememberToolCall(job, event);
     switch (event.type) {
       case 'step/start':
         job.turn = event.data?.turn ?? job.turn;
@@ -675,6 +708,7 @@ export class WorkerRegistry {
             currentJob: () => this.activeSessionJob(previous.sessionId, job),
             currentMailbox: () => this.currentMailbox(previous.sessionId),
           });
+          this.installApprovalHandoff(agentCtx, job, previous.sessionId);
           // This resumed handle can itself be continued later; its listeners
           // must follow the newest job on the session, exactly like the ones a
           // live agent inherited from spawn.

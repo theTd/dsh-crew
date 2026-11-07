@@ -91,9 +91,92 @@ expired events. A disconnected HTTP reader aborts its long-poll. MCP disconnect
 aborts the relay's pending HTTP reads.
 
 Agent messages are explicitly marked as agent-generated context and cannot grant
-human permission. Existing `ask_user_question` handling is preserved: it stops
-the worker with `needs_input` and returns the question. No automatic approvals
-are added.
+human permission. A worker's `ask_user_question` is put to the dispatcher as a
+reply-requested message (300 s), and stops the worker with `needs_input` when
+nobody answers. DSH's native tool approvals are forwarded the same way (next
+section); nothing is approved unless the dispatcher answers, except what it
+granted for the session.
+
+## Native tool approvals
+
+DSH asks for a one-shot decision through its approval service
+(`ctx.approval.request`, the `approval/request` waterfall) when a tool is called
+with `sandbox_permissions` + `justification` (a sandbox escalation, e.g. a write
+outside the workspace under the default `workspace-write`), or when a
+pre-execute gate answers "ask". `src/hub/worker-approval.mjs` claims these for
+every agent the hub creates or resumes, ahead of the Web answerer, and — when
+the running job has a mailbox — posts one reply-requested message:
+
+````text
+[approval request from the worker — it is paused for up to 600s waiting for your reply]
+Allow this call? `write` asks to run with danger-full-access sandbox permissions.
+Options: Allow once | Allow for this session | Reject
+Reply with exactly one option label. "Allow for this session" also allows every later `write` request to escalate its sandbox to danger-full-access in this worker session (until the DSH host restarts). Any other reply, or none in time, rejects the call. Answer only within the authority the user gave you; otherwise ask the user first.
+Working directory: E:\work\ws
+Justification (written by the worker model): <the model's justification>
+Called from inside the run_code program "<its description>", started 9s ago. DSH withdraws this request when that program reaches its run_code deadline, in about 590s.
+Call: `write` with arguments:
+```text
+{ "file_path": "E:\\work\\outside.txt", ... }
+```
+````
+
+The first four lines are dsh-crew's own; everything the model wrote comes after
+the `Options:` line, so a forged `Options:` line in it is never the first one.
+Answer with `dsh_worker_message(job_id, "<label>", reply_to=<message_id>)` or
+`POST /_dsh/dsh-crew/jobs/<id>/messages {message, reply_to}`.
+
+| Reply | DSH outcome |
+| --- | --- |
+| `Allow once` | `allowed-once` |
+| `Allow for this session` | `allowed-once`, and later requests with the same key are granted without asking |
+| `Reject`, any other text, or no reply within the wait | `rejected` |
+| DSH withdrew the request (deadline, cancelled turn) or the job settled | `cancelled`; a late reply is refused as "not pending" |
+
+Labels match case-insensitively; surrounding quotes, a trailing period and
+extra spaces are ignored. A request that ends without a reply leaves a
+`[approval request <id> is no longer pending: …]` message. Without a mailbox
+(no messaging token), for a settled job, or for another session, the request
+is passed on to the host's other answerers exactly as before.
+
+**What "Allow for this session" covers.** DSH's outcome vocabulary has only a
+one-shot grant, so the session grant lives in the hub: a set of keys per worker
+session id. A sandbox escalation's key is the tool name plus the target mode
+(`write` → `danger-full-access` covers every later `write` escalation to that
+mode, any path); any other ask's key is the tool name plus its exact reason
+text. The standing sandbox does not widen: the model must still request each
+escalation explicitly, and each one is granted as `allowed-once` and announced
+in the mailbox (`[approval granted without asking …]`). The grant follows the
+session into `dsh_worker_continue` turns (warm and cold) and is lost when the
+DSH host restarts; it never applies to another session.
+
+**What bounds the wait.**
+
+- dsh-crew's own wait: `approval_wait_seconds` in the hub config (default 600,
+  1–3600). While a job waits on an approval it is exempt from the stall bound;
+  its hard bound (`timeout_seconds`) and lease still apply, and settling the job
+  cancels the approval.
+- A tool the model calls directly (native preset, or `run_code` itself with
+  `sandbox_permissions` in the `ptc` preset): DSH puts no deadline on the
+  approval, so dsh-crew's wait is the bound. `run_code` declares no tool
+  timeout, and its own escalation is approved before the program's clock starts.
+- A tool called from inside a `run_code` program (`ptc` preset, the hub's
+  default; the case seen in practice): the request is bound by that program's
+  deadline, which counts nested tool and approval waits —
+  `@deepseek-ai/dsh-ptc-runtime-node` `timeoutMs` (default 120 000 ms) unless the
+  program passes its own `timeoutMs`, capped at `maxTimeoutMs` (default
+  600 000 ms). When a program's code mentions `sandbox_permissions` and the job
+  can forward approvals, dsh-crew raises that program's `timeoutMs` to the
+  runtime's `maxTimeoutMs` (read from `ctx.ptcRuntime`; nothing changes when the
+  runtime is not visible or the program asked for at least that much). A longer
+  window needs a larger `maxTimeoutMs` on the host's `ptc-runtime` plugin
+  (`cordis.patch.yml`, all sessions, DSH restart); dsh-crew cannot change it.
+- The message header states the shorter of the two windows.
+
+The approval path has unit coverage only (`tests/worker-approval.test.mjs`); it
+has not been exercised against a live DSH host. In particular the scoping of
+the agent-level `tools/execute` listener and the visibility of `ptcRuntime`
+from the plugin context are unverified.
 
 ## Wake path: a worker message wakes the dispatcher
 
@@ -340,6 +423,7 @@ file work inside the scratch workspace. These trials are pending approval.
 | `scripts/messaging-dev.ps1` | Isolated preparation/dependency/launch actions; pins the dsh generation and refuses a mismatched CLI |
 | `scripts/smoke-hub.mjs` | Live M1 probe: hub reachability, spawn, result, cancel; exit codes 0/1/2/3 |
 | `src/hub/model-selection.mjs` | dsh 0.2.2 `agent.model.select()` route application |
+| `src/hub/worker-approval.mjs` | Native approval requests to the job mailbox, session grants, run_code deadline raise |
 | `tests/worker-mailbox.test.mjs` | Ownership, replay, requests, abort, timeout |
 | `tests/channel-relay.test.mjs` | Channel metadata and disconnect cleanup |
 | `tests/worker-messaging-registry.test.mjs` | Steering, reply routing and cancellation lifecycle |
@@ -350,6 +434,7 @@ file work inside the scratch workspace. These trials are pending approval.
 | `tests/job-token-store.test.mjs` | Token file round-trip, safe file names, malformed files, 24 h prune |
 | `tests/wait-job.test.mjs` | Exit codes 0/1/2/3/4/5, worker_message lines, `--after`, fallbacks |
 | `tests/hub-model-selection.test.mjs` | Route reaches `model.select()`; no `agent/request` rewrite |
+| `tests/worker-approval.test.mjs` | Approval message shape, reply mapping, session grants, withdrawal, deadline raise, hub wiring |
 | `tests/smoke-hub.test.mjs` | Probe arguments and the documented exit codes |
 | `tests/hub-spawn-failure.test.mjs` | A failed spawn leaves no zombie job |
 | `qa/` | Per-task cases, the shared `run-all.mjs`, and the standing gap list |

@@ -53,6 +53,19 @@ What changed in each released version of `@zseven-w/dsh-crew`, newest first.
   coordinator and coordinator replies back with `reply_to`, report the final
   result, and continue the same session on follow-up. An older server whose
   spawn response has no `wait_command` falls back to returning the job id.
+- **Native tool approvals reach the dispatcher.** A worker's DSH approval
+  request (`approval/request`: a sandbox escalation such as a write outside the
+  workspace, or a pre-execute "ask") is posted to the job's mailbox as a
+  reply-requested `Allow this call?` message with
+  `Options: Allow once | Allow for this session | Reject`, the tool, the
+  justification, the working directory and the call's arguments. `Allow once`
+  grants it once; `Allow for this session` also grants later requests of the
+  same tool and target mode (or the same reason) for the rest of that worker
+  session; anything else, or no reply within `approval_wait_seconds` (default
+  600), rejects it. A run_code program that asks for a nested escalation gets
+  the PTC runtime's maximum deadline so its approval is not cancelled after
+  120 s. Jobs without a mailbox keep the old behavior. Hub-side: takes effect
+  after the DSH host loads the new package and restarts.
 
 ### Fixed
 
