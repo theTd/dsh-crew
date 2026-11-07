@@ -34,7 +34,7 @@ command docs does not know these knobs exist — dsh-qa defect-1 family
 (description drift is a functional defect). Fixed in all 19 doc surfaces.
 
 Checked and found accurate: tool descriptions vs schemas for all 6 MCP tools
-(tier/effort enums, `timeout_seconds` bounds 1–7200, `worker=` opt-in semantics,
+(tier/effort enums, `timeout_seconds` bounds 1–21600, `worker=` opt-in semantics,
 `allow_concurrent_cwd` read-only guidance); `wait_seconds` 0–7200 default 0;
 README guardrail prose vs origin-guard/cwd-lock behavior; default timeout 1800 s;
 hub URL default 3080; tier model ids.

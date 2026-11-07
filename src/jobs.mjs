@@ -8,10 +8,11 @@ import { acquireCwdLock } from './cwd-lock.mjs';
 import { ORIGIN_CHAIN_ENV, ORIGIN_DEPTH_ENV } from './origin-guard.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { crewConfigDir } from './config-paths.mjs';
+import { JobLog } from './job-log.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const CONFIG_DIR = join(homedir(), '.config', 'dsh-crew');
+const CONFIG_DIR = crewConfigDir();
 const STATUS_FILE = join(CONFIG_DIR, 'status.json');
 const RUNTIME_BIN = join(ROOT, 'node_modules', '.bin', 'dsh-jsonrpc-agent');
 const CORDIS = join(ROOT, 'worker.cordis.yml');
@@ -107,6 +108,12 @@ export function registerJob(job) {
 }
 
 export async function startJob({ task, tier = 'flash', effort = 'max', cwd, maxTokens = 49_152, timeoutMs = 1_800_000, source = 'api', origin = null, allowConcurrentCwd = false, provider, model }) {
+  // ADR 0002: dsh 0.2.2 removed @deepseek-ai/dsh-sdk-client and the
+  // dsh-sdk-jsonrpc-demo runtime this path launched, and the worker composition
+  // it named no longer exists. Re-implementing the SDK harness over
+  // dsh-sdk-protocol is its own project; until then this path refuses with one
+  // fixed sentence instead of a module-not-found hint from deep inside startup.
+  throw new Error('dsh-crew: standalone dispatch is not supported on dsh 0.2.2; start a DSH instance and use hub mode, or dispatch with worker="<profile>" for a CLI backend');
   const tierInfo = TIERS[tier];
   if (!tierInfo) throw new Error(`unknown tier "${tier}" (expected: ${Object.keys(TIERS).join(', ')})`);
   // The caller (the MCP server, which owns session-level config) may bind this
@@ -137,7 +144,21 @@ export async function startJob({ task, tier = 'flash', effort = 'max', cwd, maxT
     origin_depth: origin?.depth ?? null, origin_chain: origin?.chain ?? null,
     result: null, error: null, stopReason: null, harness: null,
     waiters: [], _releaseCwdLock: releaseLock,
+    log: new JobLog(id),
   };
+  job.log.record('status', `standalone job started tier=${tier} effort=${effort}`, { cwd: workspace });
+  const timeoutSeconds = Math.round(timeoutMs / 1000);
+  if (timeoutMs > 0) {
+    job._timeoutTimer = setTimeout(() => {
+      if (job.status !== 'running') return;
+      job.status = 'timeout';
+      job.error = `timed out after ${timeoutSeconds}s`;
+      job.log.record('status', job.error, { status: 'timeout' });
+      publishStatus();
+      try { job.harness?.close?.(); } catch {}
+    }, timeoutMs);
+    job._timeoutTimer.unref?.();
+  }
 
   try {
     // The DSH SDK is only needed by the standalone dispatch path, so it is
@@ -205,9 +226,22 @@ export async function startJob({ task, tier = 'flash', effort = 'max', cwd, maxT
       const e = n.params.event;
       if (!e?.type) return;
       switch (e.type) {
-        case 'step/start': job.turn = e.data?.turn ?? job.turn; job.step = e.data?.step ?? job.step; break;
-        case 'tool/call': job.currentTool = e.data?.name ?? null; job.toolCalls += 1; break;
-        case 'tool/result': job.currentTool = null; break;
+        case 'step/start':
+          job.turn = e.data?.turn ?? job.turn;
+          job.step = e.data?.step ?? job.step;
+          job.log.record('step', `step ${job.step} (turn ${job.turn})`, { step: job.step, turn: job.turn });
+          break;
+        case 'tool/call': {
+          const name = e.data?.name ?? 'tool';
+          job.currentTool = name;
+          job.toolCalls += 1;
+          job.log.record('tool_call', name, { tool: name });
+          break;
+        }
+        case 'tool/result':
+          job.log.record('tool_result', `${job.currentTool ?? 'tool'} finished`);
+          job.currentTool = null;
+          break;
         case 'assistant/message': {
           const u = e.data?.usage;
           if (u) {
@@ -215,9 +249,14 @@ export async function startJob({ task, tier = 'flash', effort = 'max', cwd, maxT
             job.tokens.output += u.outputTokens ?? 0;
             job.tokens.reasoning += u.reasoningTokens ?? 0;
           }
+          const text = (e.data?.message?.content ?? []).filter((c) => c?.type === 'text').map((c) => c.text).join('');
+          if (text) job.log.record('text', text);
           break;
         }
-        case 'turn/end': job.stopReason = e.data?.reason?.kind ?? null; break;
+        case 'turn/end':
+          job.stopReason = e.data?.reason?.kind ?? null;
+          job.log.record('status', `turn ended: ${job.stopReason ?? 'unknown'}`, { stop_reason: job.stopReason });
+          break;
       }
       publishStatus();
     };
@@ -225,6 +264,7 @@ export async function startJob({ task, tier = 'flash', effort = 'max', cwd, maxT
     job.promise = harness
       .run(task, { sessionId, onNotification })
       .then((result) => {
+        if (job.status !== 'running') return;
         job.result = result.finalResponse ?? '';
         const lastEnd = [...(result.events ?? [])].reverse().find((ev) => ev?.type === 'turn/end');
         job.stopReason = lastEnd?.data?.reason?.kind ?? job.stopReason;
@@ -232,12 +272,15 @@ export async function startJob({ task, tier = 'flash', effort = 'max', cwd, maxT
         if (job.status === 'failed' && !job.error) job.error = `turn ended with reason: ${job.stopReason ?? 'unknown'}`;
       })
       .catch((err) => {
-        job.status = job.status === 'cancelled' ? 'cancelled' : 'failed';
+        if (job.status !== 'running') return;
+        job.status = 'failed';
         job.error = err?.message ?? String(err);
       })
       .finally(async () => {
+        clearTimeout(job._timeoutTimer);
         job.endedAt = new Date().toISOString();
         job.currentTool = null;
+        job.log.record('status', `job ${job.status}${job.error ? `: ${job.error}` : ''}`, { status: job.status });
         try { await harness.close(); } catch {}
         // Release the cwd lock on EVERY terminal path: done, failed,
         // cancelled, request-timeout (harness rejects) all land here.
@@ -252,6 +295,8 @@ export async function startJob({ task, tier = 'flash', effort = 'max', cwd, maxT
     job.status = 'failed';
     job.error = err?.message ?? String(err);
     job.endedAt = new Date().toISOString();
+    job.log.record('error', job.error);
+    job.log.record('status', `job failed: ${job.error}`, { status: 'failed' });
     job._releaseCwdLock?.();
     job._releaseCwdLock = null;
     publishStatus();
@@ -282,6 +327,7 @@ export async function cancelJob(id) {
   if (!job) throw new Error(`no such job: ${id}`);
   if (job.status !== 'running') return job;
   job.status = 'cancelled';
+  job.log.record('status', 'cancelled by request', { status: 'cancelled' });
   job.error = 'cancelled by request';
   try { await job.harness.close(); } catch {}
   publishStatus();

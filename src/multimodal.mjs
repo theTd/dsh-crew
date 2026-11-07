@@ -20,7 +20,8 @@ import { join, isAbsolute, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { tr, setLang } from './i18n.mjs';
 
-const CONFIG_DIR = join(homedir(), '.config', 'dsh-crew');
+import { crewConfigDir } from './config-paths.mjs';
+const CONFIG_DIR = crewConfigDir();
 const CACHE_FILE = join(CONFIG_DIR, 'vision-cache.json');
 const CACHE_CAP = 200;
 

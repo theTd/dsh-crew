@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { WorkerRegistry } from '../src/hub/index.mjs';
 test('the hub preserves needs_input after disposal and exposes the unresolved question', async () => {
   let disposed = false, idle = Promise.resolve(), handler;
-  const agent = { session: {}, async whenIdle() { await idle; }, followup() {
+  const agent = { session: {}, model: { select() {} }, async whenIdle() { await idle; }, followup() {
     idle = handler({ questions: [{ id: 'q', question: 'May I overwrite the existing file?' }] }).catch(() => {
       assert.equal(disposed, true, 'runtime must be stopped before another step could run');
     });

@@ -4,9 +4,38 @@
 
 import { readGlobalConfig } from './install/install.mjs';
 import { pluginEnv } from './plugin-env.mjs';
+import { randomUUID } from 'node:crypto';
+import { writeJobToken } from './job-token-store.mjs';
 
 const BASE = (pluginEnv('CREW_HUB') ?? readGlobalConfig().hub_url).replace(/\/$/, '');
 const API = `${BASE}/_dsh/dsh-crew`;
+const messagingTokens = new Map();
+
+/**
+ * A fresh per-job token, in the one format both spawn and continue send: the
+ * MCP client owns the token, the hub only ever sees it, and the background
+ * waiter gets it through the token file below. WorkerMailbox accepts 32–128
+ * characters; a UUID is 36.
+ */
+function mintMessagingToken() {
+  return randomUUID();
+}
+
+/**
+ * Remember a job this session can message, and hand the token to the
+ * background `wait-job` process. Best effort: a token file that cannot be
+ * written only means that waiter stays status-only.
+ */
+function rememberMessagingJob(job, token) {
+  messagingTokens.set(job.id, token);
+  writeJobToken(job.id, token);
+}
+
+function messageHeaders(jobId) {
+  const token = messagingTokens.get(jobId);
+  if (!token) throw new Error('this MCP session does not own messaging for that job');
+  return { 'content-type': 'application/json', 'x-dsh-crew-job-token': token };
+}
 
 let lastProbe = { at: 0, ok: false };
 
@@ -39,16 +68,44 @@ async function call(path, init) {
  * Slicing the wait keeps every individual request short enough that no
  * runtime, proxy or load balancer can cut it.
  */
-const MAX_POLL_SLICE_SECONDS = 60;
+const MAX_POLL_SLICE_SECONDS = 30;
 
 export const hub = {
   probe: (binding) => call('/worker-probe', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(binding) }).then(b => b.result),
-  spawn: (spec) => call('/jobs', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(spec),
-  }).then((b) => b.job),
+  spawn: async (spec) => {
+    const token = mintMessagingToken();
+    const { job } = await call('/jobs', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...spec, messaging_token: token }),
+    });
+    rememberMessagingJob(job, token);
+    return job;
+  },
+  message: (id, message, replyTo) => call(`/jobs/${encodeURIComponent(id)}/messages`, {
+    method: 'POST', headers: messageHeaders(id), body: JSON.stringify({ message, reply_to: replyTo }),
+  }).then(body => body.result),
+  messages: (id, after = 0, wait = 0, signal) => call(`/jobs/${encodeURIComponent(id)}/messages?after=${after}&wait=${wait}`, {
+    headers: messageHeaders(id), signal,
+  }).then(body => body.result),
   list: () => call('/jobs').then((b) => b.jobs),
+  // A continued job is messaging-enabled exactly like a spawned one: mint the
+  // token here, send it with the request, remember it for `dsh_worker_message`
+  // and write it for the background waiter. A hub too old to read the field
+  // ignores it; the job still runs and the waiter falls back to status-only.
+  continueJob: async (id, text, timeoutSeconds) => {
+    const token = mintMessagingToken();
+    const { job } = await call(`/jobs/${encodeURIComponent(id)}/continue`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        text,
+        messaging_token: token,
+        ...(timeoutSeconds === undefined ? {} : { timeout_seconds: timeoutSeconds }),
+      }),
+    });
+    rememberMessagingJob(job, token);
+    return job;
+  },
   // The LLM routes the HOST has configured. Only the hub can answer this: the
   // MCP server is a separate process with no ctx.llm. Returns [] rather than
   // throwing when the hub is too old to serve the route, so a stale hub

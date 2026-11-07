@@ -5,9 +5,9 @@
 
 import { writeFileSync, mkdirSync, rmSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
 
-const CONFIG_DIR = join(homedir(), '.config', 'dsh-crew');
+import { crewConfigDir } from './config-paths.mjs';
+const CONFIG_DIR = crewConfigDir();
 const SHARD_DIR = join(CONFIG_DIR, 'status.d');
 export const SHARD_FRESH_MS = 30 * 60 * 1000;
 
